@@ -1,0 +1,194 @@
+#!/bin/sh
+# CCZU CMCC Portal auto-auth for OpenWrt/iStoreOS.
+# Credentials are read from UCI at runtime; never log credentials or raw responses.
+
+CONFIG="campus-auth.main"
+TAG="campus-auth"
+PORTAL_DEFAULT="http://211.103.11.101:801/eportal/"
+PROBE_URL_DEFAULT="http://connectivitycheck.gstatic.com/generate_204"
+
+log_msg() {
+    logger -t "$TAG" -- "$*"
+}
+
+cfg() {
+    uci -q get "$CONFIG.$1" 2>/dev/null
+}
+
+is_enabled() {
+    [ "$(cfg enabled)" = "1" ]
+}
+
+get_wlan_ip() {
+    local addr
+    addr="$(ubus call network.interface.wwan status 2>/dev/null | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null | head -n 1)"
+    if [ -z "$addr" ]; then
+        addr="$(ip -4 -o addr show dev sta0 2>/dev/null | awk 'NR==1 {split($4,a,"/"); print a[1]}')"
+    fi
+    printf '%s' "$addr"
+}
+
+internet_ok() {
+    local probe code
+    probe="$(cfg probe_url)"
+    [ -n "$probe" ] || probe="$PROBE_URL_DEFAULT"
+    code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
+        --max-redirs 0 --connect-timeout 5 --max-time 8 "$probe" 2>/dev/null)"
+    [ "$code" = "204" ]
+}
+
+curl_quote() {
+    # Escape values for curl's config-file syntax. Credential values themselves
+    # are supplied from short-lived files, not placed in process arguments.
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+do_login() {
+    local username password wlan_ip portal ac_name ac_ip wlan_mac callback cachebust
+    local tmpdir response result cfgfile
+
+    username="$(cfg username)"
+    password="$(cfg password)"
+    [ -n "$username" ] || { log_msg "Login skipped: username is not configured"; return 2; }
+    [ -n "$password" ] || { log_msg "Login skipped: password is not configured"; return 2; }
+
+    wlan_ip="$(get_wlan_ip)"
+    if [ -z "$wlan_ip" ]; then
+        log_msg "Login skipped: no IPv4 address found on network interface wwan/sta0"
+        return 3
+    fi
+
+    portal="$(cfg portal_url)"
+    [ -n "$portal" ] || portal="$PORTAL_DEFAULT"
+    ac_name="$(cfg wlan_ac_name)"
+    [ -n "$ac_name" ] || ac_name="0011.0519.250.00"
+    ac_ip="$(cfg wlan_ac_ip)"
+    wlan_mac="$(cfg wlan_user_mac)"
+    [ -n "$wlan_mac" ] || wlan_mac="000000000000"
+
+    callback="dr$(date +%s)$$"
+    cachebust="$(date +%s)$$"
+
+    umask 077
+    tmpdir="$(mktemp -d /tmp/campus-auth.XXXXXX 2>/dev/null)"
+    if [ -z "$tmpdir" ] || [ ! -d "$tmpdir" ]; then
+        log_msg "Login failed: could not create private temporary directory"
+        return 4
+    fi
+    trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
+
+    # Keep the password out of the process list and logs.
+    printf '%s' "$username" > "$tmpdir/account"
+    printf '%s' "$password" > "$tmpdir/password"
+    chmod 600 "$tmpdir/account" "$tmpdir/password"
+
+    # Portal expects the account field in the form ",b,<phone>".
+    # curl's name@filename syntax URL-encodes the file contents; keep it in
+    # a short-lived private file rather than in process arguments.
+    { printf ',b,'; cat "$tmpdir/account"; } > "$tmpdir/form-account"
+    chmod 600 "$tmpdir/form-account"
+
+    cfgfile="$tmpdir/request.cfg"
+    {
+        printf 'url = "%s"\n' "$(curl_quote "$portal")"
+        printf 'get\nsilent\nshow-error\nconnect-timeout = 5\nmax-time = 12\nnoproxy = "*"\n'
+        printf 'data-urlencode = "c=Portal"\n'
+        printf 'data-urlencode = "a=login"\n'
+        printf 'data-urlencode = "callback=%s"\n' "$(curl_quote "$callback")"
+        printf 'data-urlencode = "login_method=1"\n'
+        printf 'data-urlencode = "user_account@%s/form-account"\n' "$tmpdir"
+        printf 'data-urlencode = "user_password@%s/password"\n' "$tmpdir"
+        printf 'data-urlencode = "wlan_user_ip=%s"\n' "$(curl_quote "$wlan_ip")"
+        printf 'data-urlencode = "wlan_user_mac=%s"\n' "$(curl_quote "$wlan_mac")"
+        printf 'data-urlencode = "wlan_ac_ip=%s"\n' "$(curl_quote "$ac_ip")"
+        printf 'data-urlencode = "wlan_ac_name=%s"\n' "$(curl_quote "$ac_name")"
+        printf 'data-urlencode = "jsVersion=3.0"\n'
+        printf 'data-urlencode = "_=%s"\n' "$(curl_quote "$cachebust")"
+    } > "$cfgfile"
+    chmod 600 "$cfgfile"
+
+    response="$(curl --config "$cfgfile" 2>/dev/null)"
+    result="$(printf '%s' "$response" | sed -n 's/.*"result"[[:space:]]*:[[:space:]]*"\{0,1\}\([0-9][0-9]*\)"\{0,1\}.*/\1/p' | head -n 1)"
+
+    # Delete temporary files immediately, including the request config.
+    rm -rf "$tmpdir"
+    trap - EXIT HUP INT TERM
+
+    if [ "$result" = "1" ]; then
+        log_msg "Portal authentication accepted by server"
+        return 0
+    fi
+
+    if [ -z "$result" ]; then
+        log_msg "Portal authentication failed: no recognizable result from server"
+    else
+        log_msg "Portal authentication rejected (result=$result)"
+    fi
+    return 1
+}
+
+get_interval() {
+    local v
+    v="$(cfg interval)"
+    case "$v" in ''|*[!0-9]*) v=60 ;; esac
+    [ "$v" -ge 30 ] 2>/dev/null || v=30
+    [ "$v" -le 3600 ] 2>/dev/null || v=3600
+    printf '%s' "$v"
+}
+
+cmd_status() {
+    local ip
+    ip="$(get_wlan_ip)"
+    if [ -n "$ip" ]; then
+        printf '上游接口 wwan/sta0 IPv4: %s\n' "$ip"
+    else
+        printf '上游接口暂未获取 IPv4 地址\n'
+    fi
+    if internet_ok; then
+        printf '互联网检测: 正常（HTTP 204）\n'
+    else
+        printf '互联网检测: 未通过或需要 Portal 认证\n'
+    fi
+    printf '自动认证启用: %s\n' "$(cfg enabled)"
+}
+
+daemon_loop() {
+    local interval
+    log_msg "Service loop started"
+    while :; do
+        interval="$(get_interval)"
+        if ! is_enabled; then
+            sleep 30
+            continue
+        fi
+        if internet_ok; then
+            sleep "$interval"
+            continue
+        fi
+        log_msg "Internet probe did not return HTTP 204; attempting Portal authentication"
+        do_login
+        sleep 8
+        if internet_ok; then
+            log_msg "Internet connectivity verified after authentication"
+        else
+            log_msg "Internet still unavailable after authentication attempt"
+        fi
+        sleep "$interval"
+    done
+}
+
+case "$1" in
+    login)
+        do_login
+        ;;
+    check|status)
+        cmd_status
+        ;;
+    daemon)
+        daemon_loop
+        ;;
+    *)
+        echo "Usage: $0 {login|check|status|daemon}" >&2
+        exit 2
+        ;;
+esac
