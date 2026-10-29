@@ -1,0 +1,16 @@
+# Local credentials and diagnostic artifacts
+.env
+.env.*
+!.env.example
+*.log
+*.pcap
+*.pcapng
+*.har
+*.bak
+*.tar.gz
+*.zip
+credentials*
+secrets*
+config.local*
+.DS_Store
+Thumbs.db
